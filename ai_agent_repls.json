@@ -1,0 +1,100 @@
+{
+  "sliver": {
+    "launch_cmd": "sliver",
+    "prompt_pattern": "^.*?sliver\\s*.*?>\\s*$",
+    "quit_command": "exit",
+    "ready_timeout": 10,
+    "reply_timeout": 20
+  },
+  "msfconsole": {
+    "launch_cmd": "msfconsole -q",
+    "prompt_pattern": "^msf\\d*\\s*.*?>\\s*$",
+    "quit_command": "exit",
+    "ready_timeout": 15,
+    "reply_timeout": 30
+  },
+  "beef": {
+    "launch_cmd": "beef-xss",
+    "prompt_pattern": "^.*?beef.*?>\\s*$",
+    "quit_command": "exit",
+    "ready_timeout": 12,
+    "reply_timeout": 20
+  },
+  "radare2": {
+    "launch_cmd": "r2 -",
+    "prompt_pattern": "^\\[.*?\\]>\\s*$",
+    "quit_command": "q",
+    "ready_timeout": 8,
+    "reply_timeout": 15
+  },
+  "bettercap": {
+    "launch_cmd": "bettercap -no-colors",
+    "prompt_pattern": "^.*?\\s*>\\s*$",
+    "quit_command": "exit",
+    "ready_timeout": 10,
+    "reply_timeout": 15
+  },
+  "smbclient": {
+    "launch_cmd": "smbclient //localhost/IPC$ -U ''",
+    "prompt_pattern": "^smb:\\s*\\\\>\\s*$",
+    "quit_command": "exit",
+    "ready_timeout": 8,
+    "reply_timeout": 15
+  },
+  "ftp": {
+    "launch_cmd": "ftp",
+    "prompt_pattern": "^ftp>\\s*$",
+    "quit_command": "quit",
+    "ready_timeout": 6,
+    "reply_timeout": 15
+  },
+  "bluetoothctl": {
+    "launch_cmd": "bluetoothctl",
+    "prompt_pattern": "^\\[.*?\\][#>]\\s*$",
+    "quit_command": "exit",
+    "ready_timeout": 8,
+    "reply_timeout": 15
+  },
+  "lldb": {
+    "launch_cmd": "lldb",
+    "prompt_pattern": "^\\(lldb\\)\\s*$",
+    "quit_command": "quit",
+    "ready_timeout": 8,
+    "reply_timeout": 15
+  },
+  "virsh": {
+    "launch_cmd": "virsh",
+    "prompt_pattern": "^virsh\\s*#\\s*$",
+    "quit_command": "quit",
+    "ready_timeout": 8,
+    "reply_timeout": 15
+  },
+  "parted": {
+    "launch_cmd": "parted",
+    "prompt_pattern": "^\\(parted\\)\\s*$",
+    "quit_command": "quit",
+    "ready_timeout": 6,
+    "reply_timeout": 15
+  },
+  "targetcli": {
+    "launch_cmd": "targetcli",
+    "prompt_pattern": "^/.*?>\\s*$",
+    "quit_command": "exit",
+    "ready_timeout": 8,
+    "reply_timeout": 15
+  },
+  "crash": {
+    "launch_cmd": "crash",
+    "prompt_pattern": "^crash>\\s*$",
+    "quit_command": "q",
+    "ready_timeout": 12,
+    "reply_timeout": 20
+  },
+  "nslookup": {
+    "launch_cmd": "nslookup",
+    "prompt_pattern": "^>\\s*$",
+    "quit_command": "exit",
+    "ready_timeout": 6,
+    "reply_timeout": 15
+  }
+}
