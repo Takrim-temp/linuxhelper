@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-AI Linux Agent - Final Build
+AI Linux Agent - Final Build with Interactive CLI Support
 - Answers questions, executes tasks, gives final answers
 - Works on Debian/Ubuntu/Kali, RHEL/Fedora, Arch, SUSE, Alpine
 - Auto-detects distro and picks the right package manager
@@ -8,6 +8,8 @@ AI Linux Agent - Final Build
 - Auto-redirects server commands to prevent hangs
 - Validates heredocs before execution
 - Handles API rate limits (429) with backoff
+- Interactive CLI automation for allowlisted tools
+- Users can extend the allowlist by editing ~/.ai_agent_repls.json
 """
 
 import os
@@ -20,6 +22,7 @@ import shlex
 import shutil
 import argparse
 import platform
+from pathlib import Path
 from datetime import datetime
 from typing import Dict, List, Optional, Any
 
@@ -60,8 +63,146 @@ SERVER_PATTERNS = [
     r'\bgunicorn\b', r'\bdjango\s+runserver',
     r'\btail\s+-f\b', r'\bwatch\b',
     r'^top\s*$', r'^htop\s*$',
-    r'\bping\s+(?!-c)', r'\bserve\b', r'\bserver\b',
+    r'\bping\s+(?!-c)',
 ]
+
+
+# ============================================================
+# INTERACTIVE CLI ALLOWLIST — built-in tools
+# ============================================================
+# Only these tools can be driven interactively by default.
+# Users can add their own by editing ~/.ai_agent_repls.json
+# (see load_user_repls() below).
+# ============================================================
+INTERACTIVE_TOOLS = {
+    "psql": {
+        "launch_cmd": "psql",
+        "prompt_pattern": r"[=#]\s*$",
+        "quit_command": "\\q",
+        "ready_timeout": 8,
+        "reply_timeout": 15,
+    },
+    "sqlite3": {
+        "launch_cmd": "sqlite3",
+        "prompt_pattern": r"^sqlite>\s*$",
+        "quit_command": ".quit",
+        "ready_timeout": 5,
+        "reply_timeout": 10,
+    },
+    "redis-cli": {
+        "launch_cmd": "redis-cli",
+        "prompt_pattern": r":\d+>\s*$",
+        "quit_command": "quit",
+        "ready_timeout": 5,
+        "reply_timeout": 8,
+    },
+    "python3": {
+        "launch_cmd": "python3 -i",
+        "prompt_pattern": r"^>>>\s*$",
+        "quit_command": "exit()",
+        "ready_timeout": 6,
+        "reply_timeout": 15,
+    },
+    "node": {
+        "launch_cmd": "node",
+        "prompt_pattern": r"^>\s*$",
+        "quit_command": ".exit",
+        "ready_timeout": 6,
+        "reply_timeout": 15,
+    },
+    "gdb": {
+        "launch_cmd": "gdb",
+        "prompt_pattern": r"^\(gdb\)\s*$",
+        "quit_command": "quit",
+        "ready_timeout": 6,
+        "reply_timeout": 15,
+    },
+    "mysql": {
+        "launch_cmd": "mysql -u root",
+        "prompt_pattern": r"mysql>\s*$",
+        "quit_command": "exit",
+        "ready_timeout": 8,
+        "reply_timeout": 15,
+    },
+}
+
+
+USER_REPLS_FILE = Path.home() / ".ai_agent_repls.json"
+USER_REPLS_LOG = Path.home() / ".ai_agent_repls.log"
+
+
+def load_user_repls() -> Dict[str, Dict[str, Any]]:
+    """
+    Load user-declared interactive tools from ~/.ai_agent_repls.json.
+
+    The file must be created/edited manually — there is no CLI flag
+    to add or remove entries. Editing the file is the deliberate step.
+
+    Expected format:
+      {
+        "my_tool": {
+          "launch_cmd":     "my_tool --interactive",
+          "prompt_pattern": "^mytool>\\s*$",
+          "quit_command":   "quit",
+          "ready_timeout":  8,
+          "reply_timeout":  15
+        }
+      }
+
+    Returns a dict of validated tool configs. Invalid entries are skipped
+    and logged.
+    """
+    if not USER_REPLS_FILE.exists():
+        return {}
+
+    try:
+        raw = json.loads(USER_REPLS_FILE.read_text())
+    except Exception as e:
+        print(f"⚠  Could not parse {USER_REPLS_FILE}: {e}")
+        return {}
+
+    if not isinstance(raw, dict):
+        print(f"⚠  {USER_REPLS_FILE} must contain a JSON object at the top level")
+        return {}
+
+    validated: Dict[str, Dict[str, Any]] = {}
+    required = ("launch_cmd", "prompt_pattern", "quit_command")
+
+    for name, cfg in raw.items():
+        if not isinstance(cfg, dict):
+            print(f"⚠  Skipping '{name}': not a JSON object")
+            continue
+        missing = [k for k in required if k not in cfg]
+        if missing:
+            print(f"⚠  Skipping '{name}': missing required keys {missing}")
+            continue
+        # Validate the prompt_pattern compiles
+        try:
+            re.compile(cfg["prompt_pattern"])
+        except re.error as e:
+            print(f"⚠  Skipping '{name}': invalid prompt_pattern regex: {e}")
+            continue
+
+        cfg.setdefault("ready_timeout", 8)
+        cfg.setdefault("reply_timeout", 15)
+        validated[name] = cfg
+
+    if validated:
+        # Append to the user log so additions are auditable
+        try:
+            with open(USER_REPLS_LOG, "a") as f:
+                f.write(f"[{datetime.now().isoformat()}] loaded user repls: "
+                        f"{', '.join(validated.keys())}\n")
+        except Exception:
+            pass
+
+    return validated
+
+
+def get_interactive_tools() -> Dict[str, Dict[str, Any]]:
+    """Built-ins plus user additions. Built-ins win on name conflicts."""
+    user = load_user_repls()
+    return {**user, **INTERACTIVE_TOOLS}
 
 
 def detect_distro() -> Dict[str, str]:
@@ -158,6 +299,9 @@ class AIAgent:
         self.session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.distro = detect_distro()
 
+        # Interactive tools = built-ins + user's ~/.ai_agent_repls.json
+        self.interactive_tools = get_interactive_tools()
+
         self.terminals = {
             'xfce4-terminal': shutil.which('xfce4-terminal'),
             'gnome-terminal': shutil.which('gnome-terminal'),
@@ -171,6 +315,7 @@ class AIAgent:
             ['xfce4-terminal', 'gnome-terminal', 'konsole', 'xterm']
         )
 
+    # -------------------- logging --------------------
     def log(self, msg: str, level: str = "INFO"):
         ts = datetime.now().strftime("%H:%M:%S")
         print(f"[{ts}] [{level}] {msg}")
@@ -179,6 +324,7 @@ class AIAgent:
         if self.debug:
             self.log(msg, "DEBUG")
 
+    # -------------------- safety --------------------
     def is_dangerous(self, cmd: str) -> bool:
         for p in DANGEROUS_PATTERNS:
             if re.search(p, cmd, re.IGNORECASE):
@@ -202,6 +348,15 @@ class AIAgent:
                 return False
         return True
 
+    def _match_interactive_tool(self, cmd: str) -> Optional[str]:
+        cmd = cmd.strip()
+        first_token = cmd.split()[0] if cmd.split() else ''
+        base = os.path.basename(first_token)
+        if base in self.interactive_tools:
+            return base
+        return None
+
+    # -------------------- API --------------------
     def test_api(self) -> bool:
         self.log(f"Testing API ({self.model})...")
         for m in [self.model, "gemini-1.5-flash", "gemini-pro", "gemini-1.5-pro"]:
@@ -317,10 +472,8 @@ Reply with ONE word only."""
             return entry
 
         if self._heredoc_incomplete(cmd):
-            self.log("INCOMPLETE HEREDOC — needs body and terminator in one command", "ERROR")
-            entry = self._err(cmd,
-                              "Incomplete heredoc: the terminator line is missing. "
-                              "Re-send the ENTIRE heredoc as a single COMMAND block.",
+            self.log("INCOMPLETE HEREDOC", "ERROR")
+            entry = self._err(cmd, "Incomplete heredoc: terminator missing.",
                               "command")
             self.history.append(entry)
             return entry
@@ -337,7 +490,7 @@ Reply with ONE word only."""
             self._preview(entry)
             return entry
         except subprocess.TimeoutExpired:
-            self.log(f"TIMEOUT after {self.timeout}s — killing leftover processes", "ERROR")
+            self.log(f"TIMEOUT after {self.timeout}s", "ERROR")
             try:
                 subprocess.run(f"pkill -f {shlex.quote(cmd)}",
                                shell=True, capture_output=True, timeout=5)
@@ -351,6 +504,125 @@ Reply with ONE word only."""
             entry = self._err(cmd, str(e), "command")
             self.history.append(entry)
             return entry
+
+    def run_interactive(self, tool_name: str, launch_cmd: str,
+                        commands: List[str],
+                        reply_timeout: Optional[int] = None) -> Dict[str, Any]:
+        cfg = self.interactive_tools.get(tool_name)
+        if not cfg:
+            entry = self._err(launch_cmd,
+                              f"Tool not declared: {tool_name}", "interactive")
+            self.history.append(entry)
+            return entry
+
+        reply_timeout = reply_timeout or cfg.get("reply_timeout", 15)
+        prompt_re = re.compile(cfg["prompt_pattern"], re.MULTILINE)
+        ready_timeout = cfg.get("ready_timeout", 8)
+        quit_cmd = cfg.get("quit_command", "exit")
+
+        self.log(f"INTERACTIVE [{tool_name}]: "
+                 f"{'; '.join(commands[:3])}"
+                 f"{' ...' if len(commands) > 3 else ''}", "EXEC")
+
+        transcript = []
+        success = False
+        error = ""
+
+        try:
+            proc = subprocess.Popen(
+                cfg["launch_cmd"], shell=True,
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True, bufsize=1, cwd=self.working_dir,
+            )
+        except Exception as e:
+            entry = self._err(launch_cmd, f"Launch failed: {e}", "interactive")
+            self.history.append(entry)
+            return entry
+
+        def read_until_prompt(timeout_s: float) -> str:
+            buf = ""
+            deadline = time.time() + timeout_s
+            while time.time() < deadline:
+                try:
+                    line = proc.stdout.readline()
+                except Exception:
+                    break
+                if not line:
+                    break
+                buf += line
+                if prompt_re.search(buf):
+                    return buf
+            return buf
+
+        try:
+            initial = read_until_prompt(ready_timeout)
+            transcript.append(("__startup__", initial))
+
+            if not prompt_re.search(initial):
+                error = f"No prompt within {ready_timeout}s"
+                self.log(f"❌ {error}", "ERROR")
+            else:
+                for cmd in commands:
+                    if self.is_dangerous(cmd):
+                        transcript.append((cmd, "BLOCKED: dangerous"))
+                        self.log(f"  BLOCKED: {cmd}", "ERROR")
+                        continue
+                    self.log(f"  → {cmd}", "EXEC")
+                    try:
+                        proc.stdin.write(cmd + "\n")
+                        proc.stdin.flush()
+                    except Exception as e:
+                        transcript.append((cmd, f"Write failed: {e}"))
+                        break
+
+                    reply = read_until_prompt(reply_timeout)
+                    transcript.append((cmd, reply))
+
+                    if not prompt_re.search(reply):
+                        error = f"No prompt after: {cmd}"
+                        break
+
+                success = not error
+
+            try:
+                proc.stdin.write(quit_cmd + "\n")
+                proc.stdin.flush()
+                time.sleep(0.5)
+            except Exception:
+                pass
+        finally:
+            try:
+                proc.terminate()
+                proc.wait(timeout=3)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+
+        out_lines = []
+        for cmd, reply in transcript:
+            if cmd == "__startup__":
+                out_lines.append(f"[startup]\n{reply}")
+            else:
+                out_lines.append(f">>> {cmd}\n{reply}")
+        output = "\n".join(out_lines)
+
+        entry = self._entry(launch_cmd, success, output, error, 0, "interactive")
+        entry.update({
+            'tool': tool_name,
+            'commands': commands,
+            'transcript': transcript,
+        })
+        self.history.append(entry)
+
+        if success:
+            self.log(f"✅ Interactive session completed "
+                     f"({len(commands)} commands)", "SUCCESS")
+        else:
+            self.log(f"❌ Interactive session failed: {error}", "ERROR")
+        return entry
 
     def run_persistent(self, cmd: str) -> Dict[str, Any]:
         self.log(f"PERSISTENT: {cmd}", "EXEC")
@@ -388,8 +660,7 @@ Reply with ONE word only."""
                 pass
 
             out = (f"Background process started\n"
-                   f"PID: {pid}\n"
-                   f"Log: {log_file}\n"
+                   f"PID: {pid}\nLog: {log_file}\n"
                    f"Status: {'RUNNING' if alive else 'DIED'}\n"
                    f"Stop with: kill {pid}")
             if log_tail:
@@ -405,7 +676,7 @@ Reply with ONE word only."""
                     'command': cmd, 'pid': pid, 'log_file': log_file,
                     'pid_file': pid_file, 'started': datetime.now().isoformat()
                 })
-                self.log(f"✅ Running (PID {pid}) — log: {log_file}", "SUCCESS")
+                self.log(f"✅ Running (PID {pid})", "SUCCESS")
             else:
                 self.log(f"❌ Process died — {log_tail[:200]}", "ERROR")
             return entry
@@ -467,64 +738,50 @@ Reply with ONE word only."""
                        shell=True)
         inner = f"bash -c {shlex.quote(cmd)}"
         launch = f"tmux new-session -d -s {shlex.quote(session)} {shlex.quote(inner)}"
-        self.dbg(f"tmux launch: {launch}")
-
         try:
             r = subprocess.run(launch, shell=True, capture_output=True,
                                text=True, timeout=5)
-            if r.returncode != 0:
-                self.dbg(f"tmux stderr: {r.stderr.strip()[:300]}")
             time.sleep(0.8)
-
             check = subprocess.run(f"tmux has-session -t {shlex.quote(session)}",
                                    shell=True, capture_output=True)
             alive = check.returncode == 0
 
             out = (f"tmux session '{session}' {'started' if alive else 'FAILED'}\n"
                    f"Attach:  tmux attach -t {session}\n"
-                   f"Detach:  Ctrl+B then D\n"
-                   f"Kill:    tmux kill-session -t {session}\n"
-                   f"List:    tmux ls")
-
+                   f"Kill:    tmux kill-session -t {session}")
             entry = self._entry(cmd, alive, out,
                                 r.stderr if not alive else "", 0, "terminal")
             entry.update({'session': session, 'terminal': 'tmux'})
             self.history.append(entry)
-
             if alive:
                 self.log(f"✅ tmux session '{session}' running", "SUCCESS")
                 self.log(f"   Attach: tmux attach -t {session}")
             else:
-                self.log(f"❌ tmux failed: {r.stderr.strip()[:200]}", "ERROR")
+                self.log("❌ tmux failed", "ERROR")
             return entry
         except Exception as e:
-            self.log(f"tmux exception: {e}", "ERROR")
             entry = self._err(cmd, str(e), "terminal")
             self.history.append(entry)
             return entry
 
     def _gui_terminal(self, cmd, session, launcher_fn, term_name):
-        keep_open = f"{cmd}; echo; echo '[process exited - press Enter to close]'; read"
+        keep_open = f"{cmd}; echo; echo '[exited]'; read"
         try:
             argv = launcher_fn(keep_open, session)
-            self.dbg(f"{term_name} argv: {argv}")
             subprocess.Popen(
                 argv,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                stdin=subprocess.DEVNULL,
-                start_new_session=True,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL, start_new_session=True,
             )
             time.sleep(1.5)
             entry = self._entry(cmd, True,
-                                f"{term_name} window '{session}' opened with: {cmd}",
+                                f"{term_name} window '{session}' opened: {cmd}",
                                 "", 0, "terminal")
             entry.update({'session': session, 'terminal': term_name})
             self.history.append(entry)
-            self.log(f"✅ {term_name} window opened (session: {session})", "SUCCESS")
+            self.log(f"✅ {term_name} window opened", "SUCCESS")
             return entry
         except Exception as e:
-            self.log(f"❌ Failed to open {term_name}: {e}", "ERROR")
             entry = self._err(cmd, str(e), "terminal")
             self.history.append(entry)
             return entry
@@ -580,9 +837,8 @@ Reply with ONE word only."""
                                    capture_output=True, text=True)
             alive = check.returncode == 0 and pid in check.stdout
 
-            out = (f"Detached daemon started\nPID: {pid}\n"
-                   f"Log: {log_file}\nStatus: {'RUNNING' if alive else 'DIED'}\n"
-                   f"Stop with: kill {pid}")
+            out = (f"Detached daemon started\nPID: {pid}\nLog: {log_file}\n"
+                   f"Status: {'RUNNING' if alive else 'DIED'}")
             entry = self._entry(cmd, alive, out, "", 0, "detached")
             entry.update({'pid': pid, 'log_file': log_file})
             self.history.append(entry)
@@ -618,6 +874,7 @@ Reply with ONE word only."""
             )
 
         terminals = [k for k, v in self.terminals.items() if v]
+        interactive_list = ", ".join(self.interactive_tools.keys())
         d = self.distro
 
         system = f"""You are a Linux command execution agent running on {d['name']} (family: {d.get('family', 'unknown')}).
@@ -625,45 +882,48 @@ Reply with ONE word only."""
 DISTRO PACKAGE MANAGER (USE THIS, NOT OTHERS):
   Update : {d['pkg_update']}
   Install: {d['pkg_install']}
-  Search : {d['pkg_search']}
 NEVER use apt on non-Debian systems. NEVER use dnf on Debian systems.
-Note: yum and dnf are interchangeable on RHEL systems.
 
 COMMAND TYPES:
   COMMAND: <cmd>       - regular blocking command, wait for result
   PERSISTENT: <cmd>    - background process (nohup)
   TERMINAL: <cmd>      - open in a NEW visible terminal window
   DETACH: <cmd>        - full daemon (setsid)
+  INTERACTIVE: <tool> | <cmd1> ; <cmd2> ; <cmd3>
+                       - drive an interactive REPL from the declared list.
+                       Format: tool name, pipe, then commands separated by ' ; '.
+
+INTERACTIVE MODE:
+- Only these tools support INTERACTIVE: {interactive_list}
+- Use INTERACTIVE when the user wants to run commands inside one of those
+  tools (SQL queries, Python expressions, Redis commands, etc.).
+- Do NOT use INTERACTIVE for tools not in the list — use TERMINAL instead.
 
 HEREDOCS:
-- If you use a heredoc (cat << 'EOF' ... EOF), the ENTIRE thing — header,
-  body, and terminator — MUST be in a single COMMAND block.
-- You cannot split a heredoc across multiple COMMAND blocks.
-- Prefer 'printf' or 'tee' for short file writes.
+- If you use a heredoc, the ENTIRE thing (header, body, terminator) MUST be
+  in a single COMMAND block.
 
 RULES:
 - NEVER type "tmux", "xterm", "xfce4-terminal", "gnome-terminal", "konsole",
-  "--command=" or "-e" in your command. The agent opens the terminal for you.
-- After "TERMINAL:", write ONLY the bare command. Examples:
-    TERMINAL: python3 -m http.server 9000
-    TERMINAL: watch -n 1 free -m
+  "--command=" or "-e" in your command.
+- After "TERMINAL:", write ONLY the bare command.
 - For servers/listeners/long-running commands, ALWAYS use TERMINAL or
-  PERSISTENT. NEVER use COMMAND — it will hang and time out.
+  PERSISTENT, never COMMAND.
 - NEVER repeat a command already in history.
   * If "Address already in use", use a DIFFERENT port.
-  * If a command failed, change the approach — do NOT retry verbatim.
-- If last shows "Timeout after 60s", switch to TERMINAL/PERSISTENT for retry.
-- If last shows "Permission denied", retry with "sudo" prefix.
-- When you have enough info to answer, reply: TASK_COMPLETE
+  * If a command failed, change the approach.
+- If last shows "Timeout after 60s", switch to TERMINAL/PERSISTENT.
+- If last shows "Permission denied", retry with "sudo".
+- When you have enough info, reply: TASK_COMPLETE
 
 Format:
-  <COMMAND|PERSISTENT|TERMINAL|DETACH>: <bare command>
+  <TYPE>: <content>
   REASON: <why>
   EXPECTED_OUTCOME: <expected>
 
 OR just: TASK_COMPLETE
 
-Available terminals: {', '.join(terminals) or 'none (will use persistent)'}"""
+Available terminals: {', '.join(terminals) or 'none'}"""
 
         user = f"""USER REQUEST: {user_input}
 
@@ -689,13 +949,15 @@ Next step?"""
 
     def _parse(self, raw: str) -> Dict:
         d = {'action_type': None, 'command': None, 'reason': '',
-             'expected': '', 'is_complete': False, 'refusal': None}
+             'expected': '', 'is_complete': False, 'refusal': None,
+             'interactive_tool': None, 'interactive_cmds': None}
 
         prefixes = {
             'COMMAND:': 'command',
             'PERSISTENT:': 'persistent',
             'TERMINAL:': 'terminal',
             'DETACH:': 'detached',
+            'INTERACTIVE:': 'interactive',
         }
 
         for line in raw.split('\n'):
@@ -708,7 +970,14 @@ Next step?"""
             for pfx, kind in prefixes.items():
                 if line.upper().startswith(pfx):
                     d['action_type'] = kind
-                    d['command'] = line[len(pfx):].strip()
+                    payload = line[len(pfx):].strip()
+                    d['command'] = payload
+                    if kind == 'interactive' and '|' in payload:
+                        parts = payload.split('|', 1)
+                        d['interactive_tool'] = parts[0].strip()
+                        d['interactive_cmds'] = [
+                            c.strip() for c in parts[1].split(';') if c.strip()
+                        ]
                     break
             if line.upper().startswith('REASON:'):
                 d['reason'] = line[7:].strip()
@@ -731,17 +1000,18 @@ Next step?"""
                 'session': h.get('session'),
                 'terminal': h.get('terminal'),
                 'log_file': h.get('log_file'),
+                'tool': h.get('tool'),
             })
 
         system = """You are a Linux assistant. Produce the FINAL ANSWER to the user's request.
 
 RULES:
 1. DIRECTLY answer what they asked - specific and concrete.
-2. Use REAL data from outputs (actual IPs, ports, PIDs, session names).
-3. If a background process was started: give exact PID, log path, and kill command.
+2. Use REAL data from outputs (actual IPs, ports, PIDs, session names, query results).
+3. If a background process was started: give PID, log path, kill command.
 4. If a tmux session was created: give the exact attach command.
-5. If a GUI terminal window opened: tell them to look at the window on screen.
-6. If it's a file server: give the exact URL.
+5. If a GUI terminal window opened: tell them to look at the window.
+6. If an interactive session ran: summarize what the queries/commands returned.
 7. If some info wasn't obtained, say so briefly.
 8. Never just repeat raw output - interpret and present.
 
@@ -811,8 +1081,6 @@ Write the final answer."""
             print("\n🔧 Active background processes:")
             for b in self.background:
                 print(f"  • PID {b['pid']}: {b['command'][:60]}")
-                if b.get('log_file'):
-                    print(f"    log: {b['log_file']}")
 
         print("\n" + "=" * 80 + "\n")
 
@@ -860,7 +1128,7 @@ Write the final answer."""
             d = self.next_action(user_input)
 
             if d.get('refusal'):
-                self.log("AI declined to continue this task.", "WARN")
+                self.log("AI declined.", "WARN")
                 self.display_answer(d['refusal'], "AI REFUSAL")
                 return {'type': 'refusal', 'content': d['refusal']}
 
@@ -899,11 +1167,25 @@ Write the final answer."""
             atype = d.get('action_type', 'command')
 
             if atype == 'command' and self._looks_like_server(cmd):
-                self.log("⚙  Auto-redirecting server-like command to TERMINAL "
-                         "(COMMAND would hang)", "WARN")
+                self.log("⚙  Auto-redirecting server-like command to TERMINAL", "WARN")
                 atype = 'terminal'
 
-            if atype == 'terminal':
+            if atype == 'interactive':
+                tool = d.get('interactive_tool')
+                cmds = d.get('interactive_cmds') or []
+                if not tool or tool not in self.interactive_tools:
+                    self.log(f"❌ Tool not declared: {tool}", "ERROR")
+                    entry = self._err(cmd, f"Tool not declared: {tool}",
+                                      "interactive")
+                    self.history.append(entry)
+                elif not cmds:
+                    self.log("❌ No interactive commands provided", "ERROR")
+                    entry = self._err(cmd, "No interactive commands",
+                                      "interactive")
+                    self.history.append(entry)
+                else:
+                    self.run_interactive(tool, cmd, cmds)
+            elif atype == 'terminal':
                 self.run_terminal(cmd)
             elif atype == 'persistent':
                 self.run_persistent(cmd)
@@ -939,9 +1221,9 @@ def main():
   python ai_agent.py --api-key KEY "what is nginx?"
   python ai_agent.py --api-key KEY --auto-approve "what's my IP?"
   python ai_agent.py --api-key KEY --auto-approve --terminal gui \\
-    "in a new terminal start a python http server on port 9000"
-  python ai_agent.py --api-key KEY --auto-approve --terminal tmux \\
-    "in a new terminal start a python http server on port 9000"
+    "start a python http server on port 9000 in a new terminal"
+  python ai_agent.py --api-key KEY --auto-approve \\
+    "run 'SELECT count(*) FROM users' inside psql"
 """)
     ap.add_argument('input', help='Question or task')
     ap.add_argument('--api-key', required=True)
@@ -972,11 +1254,9 @@ def main():
     if agent.terminal_pref in ("auto", "gui"):
         has_display = bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
         if not has_display:
-            print("⚠  No DISPLAY/WAYLAND_DISPLAY detected — GUI terminal "
-                  "windows won't be visible. Use --terminal tmux over SSH.\n")
+            print("⚠  No DISPLAY detected — use --terminal tmux over SSH.\n")
         elif not agent.gui_available:
-            print("⚠  --terminal gui requested but no GUI terminal emulator "
-                  "installed. Install one: sudo apt install -y xfce4-terminal\n")
+            print("⚠  --terminal gui requested but no GUI terminal installed.\n")
 
     print("=" * 80)
     print("🤖 AI LINUX AGENT")
@@ -989,7 +1269,10 @@ def main():
     print(f"Approve:   {'auto' if args.auto_approve else 'manual'}")
     print(f"Terminal:  {agent.terminal_pref}")
     terms = [k for k, v in agent.terminals.items() if v]
-    print(f"Available: {', '.join(terms) if terms else 'none'}")
+    print(f"Terminals: {', '.join(terms) if terms else 'none'}")
+    print(f"Repls:     {', '.join(agent.interactive_tools.keys())}")
+    if USER_REPLS_FILE.exists():
+        print(f"User repls file: {USER_REPLS_FILE}")
     print("=" * 80)
 
     try:
