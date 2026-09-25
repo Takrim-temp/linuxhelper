@@ -1,4 +1,4 @@
-This project uses the Gemini model, so you need to create an account in Google AI Studio ([https://aistudio.google.com/api-keys](https://aistudio.google.com/api-keys)) and get an API key from there. If you use other models, just change the source code accordingly.
+This project uses the Gemini model, so you need to create an account in Google AI Studio ([https://aistudio.google.com/api-keys](https://aistudio.google.com/api-keys)) and get an API key from there. If you use other models, just change the source code accordingly. Edit ~/.ai_agent_repls.json only when you want the agent to drive an interactive tool that isn't in the built-in list.
 
 **Installation Guide for Debian / Ubuntu / Kali**
 
